@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Publish a static 90-day OpenRouter public-token-usage chart for GitHub Pages."""
+"""Publish recent, full-history, and monthly-growth OpenRouter charts."""
 
 from __future__ import annotations
 
+import calendar
 import html
 import json
 import math
@@ -30,7 +31,9 @@ DATASET_START = date(2025, 1, 1)
 TRILLION = 1_000_000_000_000
 REPORT_DAYS = 90
 OUTPUT_DIRECTORY = Path(__file__).resolve().with_name("docs")
-CHART_PATH = OUTPUT_DIRECTORY / "daily_usage.png"
+RECENT_CHART_PATH = OUTPUT_DIRECTORY / "daily_usage.png"
+LONG_TERM_CHART_PATH = OUTPUT_DIRECTORY / "long_term_usage.png"
+MONTHLY_GROWTH_CHART_PATH = OUTPUT_DIRECTORY / "monthly_growth.png"
 INDEX_PATH = OUTPUT_DIRECTORY / "index.html"
 METADATA_PATH = OUTPUT_DIRECTORY / "report.json"
 
@@ -134,13 +137,26 @@ def fetch_daily_totals(api_key: str) -> tuple[list[date], list[float], dict[str,
         probe_rows, probe_meta = validate_response(request_json(session, api_key))
         del probe_rows
         latest = date.fromisoformat(probe_meta["end_date"])
-        start = max(DATASET_START, latest - timedelta(days=REPORT_DAYS - 1))
-        payload = request_json(
-            session,
-            api_key,
-            {"start_date": start.isoformat(), "end_date": latest.isoformat()},
-        )
-        rows, meta = validate_response(payload, start, latest)
+        rows: list[dict[str, Any]] = []
+        response_meta: list[dict[str, str]] = []
+        window_start = DATASET_START
+        while window_start <= latest:
+            # Keep each inclusive request safely below the API's 366-day cap.
+            window_end = min(window_start + timedelta(days=364), latest)
+            payload = request_json(
+                session,
+                api_key,
+                {
+                    "start_date": window_start.isoformat(),
+                    "end_date": window_end.isoformat(),
+                },
+            )
+            window_rows, window_meta = validate_response(
+                payload, window_start, window_end
+            )
+            rows.extend(window_rows)
+            response_meta.append(window_meta)
+            window_start = window_end + timedelta(days=1)
 
     totals: dict[date, int] = {}
     for row in rows:
@@ -149,12 +165,23 @@ def fetch_daily_totals(api_key: str) -> tuple[list[date], list[float], dict[str,
     if latest not in totals:
         raise ReportError(f"The latest date, {latest}, has no token total.")
 
-    calendar_dates = [start + timedelta(days=i) for i in range((latest - start).days + 1)]
+    calendar_dates = [
+        DATASET_START + timedelta(days=i)
+        for i in range((latest - DATASET_START).days + 1)
+    ]
     values = [float(totals[day]) if day in totals else math.nan for day in calendar_dates]
+    meta = {
+        "as_of": max(item["as_of"] for item in response_meta),
+        "start_date": DATASET_START.isoformat(),
+        "end_date": latest.isoformat(),
+        "version": ", ".join(sorted({item["version"] for item in response_meta})),
+    }
     return calendar_dates, values, meta
 
 
-def rolling_average(values: list[float], window: int = 7) -> list[float]:
+def rolling_average(
+    values: list[float], window: int = 7, min_periods: int = 3
+) -> list[float]:
     averages: list[float] = []
     for index in range(len(values)):
         sample = [
@@ -162,24 +189,46 @@ def rolling_average(values: list[float], window: int = 7) -> list[float]:
             for value in values[max(0, index - window + 1) : index + 1]
             if not math.isnan(value)
         ]
-        averages.append(sum(sample) / len(sample) if len(sample) >= 3 else math.nan)
+        averages.append(
+            sum(sample) / len(sample) if len(sample) >= min_periods else math.nan
+        )
     return averages
 
 
-def render_chart(dates: list[date], token_values: list[float], meta: dict[str, str]) -> None:
-    values = [value / TRILLION if not math.isnan(value) else math.nan for value in token_values]
+def validate_chart(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size < 10_000:
+        raise ReportError(f"The chart image {path.name} was not generated correctly.")
+
+
+def render_recent_chart(
+    dates: list[date], token_values: list[float], meta: dict[str, str]
+) -> None:
+    recent_dates = dates[-REPORT_DAYS:]
+    recent_tokens = token_values[-REPORT_DAYS:]
+    values = [
+        value / TRILLION if not math.isnan(value) else math.nan
+        for value in recent_tokens
+    ]
     averages = [
         value / TRILLION if not math.isnan(value) else math.nan
-        for value in rolling_average(token_values)
+        for value in rolling_average(recent_tokens)
     ]
     latest = date.fromisoformat(meta["end_date"])
     latest_value = values[-1]
 
     plt.style.use("seaborn-v0_8-whitegrid")
     figure, axis = plt.subplots(figsize=(11.5, 5.6))
-    axis.plot(dates, values, color="#3274A1", linewidth=1.8, label="Daily tokens")
-    axis.fill_between(dates, values, 0, color="#3274A1", alpha=0.12)
-    axis.plot(dates, averages, color="#E1812C", linewidth=2.4, label="7-day average")
+    axis.plot(
+        recent_dates, values, color="#3274A1", linewidth=1.8, label="Daily tokens"
+    )
+    axis.fill_between(recent_dates, values, 0, color="#3274A1", alpha=0.12)
+    axis.plot(
+        recent_dates,
+        averages,
+        color="#E1812C",
+        linewidth=2.4,
+        label="7-day average",
+    )
     axis.scatter([latest], [latest_value], color="#17365D", s=42, zorder=5)
     axis.annotate(
         f"{latest_value:,.1f}T",
@@ -209,19 +258,183 @@ def render_chart(dates: list[date], token_values: list[float], meta: dict[str, s
     figure.text(
         0.01,
         0.01,
-        "Source: OpenRouter Data API. Public traffic only; missing dates are shown as gaps.",
+        f"Source: OpenRouter (openrouter.ai/rankings), as of {meta['as_of']}. Public traffic only; missing dates are shown as gaps.",
         fontsize=8.5,
         color="#666666",
     )
     figure.tight_layout(rect=(0, 0.045, 1, 1))
     OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    figure.savefig(CHART_PATH, dpi=160, bbox_inches="tight", facecolor="white")
+    figure.savefig(
+        RECENT_CHART_PATH, dpi=160, bbox_inches="tight", facecolor="white"
+    )
     plt.close(figure)
-    if not CHART_PATH.is_file() or CHART_PATH.stat().st_size < 10_000:
-        raise ReportError("The chart image was not generated correctly.")
+    validate_chart(RECENT_CHART_PATH)
 
 
-def write_page(token_values: list[float], meta: dict[str, str]) -> None:
+def render_long_term_chart(
+    dates: list[date], token_values: list[float], meta: dict[str, str]
+) -> None:
+    values = [
+        value / TRILLION if not math.isnan(value) else math.nan
+        for value in token_values
+    ]
+    averages = [
+        value / TRILLION if not math.isnan(value) else math.nan
+        for value in rolling_average(token_values, window=30, min_periods=15)
+    ]
+    latest = date.fromisoformat(meta["end_date"])
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    figure, axis = plt.subplots(figsize=(11.5, 5.6))
+    axis.plot(
+        dates,
+        values,
+        color="#76A5BF",
+        linewidth=0.9,
+        alpha=0.65,
+        label="Daily tokens",
+    )
+    axis.plot(
+        dates,
+        averages,
+        color="#17365D",
+        linewidth=2.5,
+        label="30-day average",
+    )
+    axis.set_title(
+        f"OpenRouter Full-History Token Usage — {DATASET_START:%d %b %Y} to {latest:%d %b %Y}",
+        loc="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#17365D",
+        pad=14,
+    )
+    axis.set_ylabel("Tokens (trillions)")
+    axis.set_xlabel("")
+    axis.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    axis.tick_params(axis="x", rotation=35)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.legend(loc="upper left", frameon=False, ncols=2)
+    axis.margins(x=0.01)
+    figure.text(
+        0.01,
+        0.01,
+        f"Source: OpenRouter (openrouter.ai/rankings), as of {meta['as_of']}. Complete available history; missing dates are shown as gaps.",
+        fontsize=8.5,
+        color="#666666",
+    )
+    figure.tight_layout(rect=(0, 0.055, 1, 1))
+    figure.savefig(
+        LONG_TERM_CHART_PATH, dpi=160, bbox_inches="tight", facecolor="white"
+    )
+    plt.close(figure)
+    validate_chart(LONG_TERM_CHART_PATH)
+
+
+def next_month(month_start: date) -> date:
+    if month_start.month == 12:
+        return date(month_start.year + 1, 1, 1)
+    return date(month_start.year, month_start.month + 1, 1)
+
+
+def monthly_growth_series(
+    dates: list[date], token_values: list[float], latest: date
+) -> tuple[list[date], list[float]]:
+    daily = {
+        day: value
+        for day, value in zip(dates, token_values)
+        if not math.isnan(value)
+    }
+    months: list[date] = []
+    totals: list[float | None] = []
+    month_start = DATASET_START.replace(day=1)
+    while month_start <= latest.replace(day=1):
+        days_in_month = calendar.monthrange(month_start.year, month_start.month)[1]
+        expected = [month_start + timedelta(days=index) for index in range(days_in_month)]
+        complete = expected[-1] <= latest and all(day in daily for day in expected)
+        months.append(month_start)
+        totals.append(sum(daily[day] for day in expected) if complete else None)
+        month_start = next_month(month_start)
+
+    growth_months = months[1:]
+    growth_values: list[float] = []
+    for previous, current in zip(totals, totals[1:]):
+        if previous is None or current is None or previous == 0:
+            growth_values.append(math.nan)
+        else:
+            growth_values.append((current / previous - 1) * 100)
+    return growth_months, growth_values
+
+
+def render_monthly_growth_chart(
+    dates: list[date], token_values: list[float], meta: dict[str, str]
+) -> None:
+    latest = date.fromisoformat(meta["end_date"])
+    months, growth_values = monthly_growth_series(dates, token_values, latest)
+    if not any(not math.isnan(value) for value in growth_values):
+        raise ReportError("No complete consecutive months were available for growth rates.")
+
+    positions = list(range(len(months)))
+    colors = [
+        "#2E8B57" if value >= 0 else "#C75050"
+        for value in growth_values
+    ]
+    figure, axis = plt.subplots(figsize=(11.5, 5.6))
+    bars = axis.bar(positions, growth_values, color=colors, width=0.72)
+    axis.axhline(0, color="#6B7280", linewidth=1)
+    for bar, value in zip(bars, growth_values):
+        if math.isnan(value):
+            continue
+        offset = 3 if value >= 0 else -5
+        vertical_alignment = "bottom" if value >= 0 else "top"
+        axis.annotate(
+            f"{value:+.1f}%",
+            xy=(bar.get_x() + bar.get_width() / 2, value),
+            xytext=(0, offset),
+            textcoords="offset points",
+            ha="center",
+            va=vertical_alignment,
+            fontsize=8,
+            color="#374151",
+        )
+    figure.suptitle(
+        "OpenRouter Monthly Token Growth — Full History",
+        x=0.065,
+        y=0.98,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#17365D",
+    )
+    axis.set_ylabel("Month-over-month growth (%)")
+    axis.set_xlabel("")
+    axis.set_xticks(positions)
+    axis.set_xticklabels([month.strftime("%b %y") for month in months], rotation=40, ha="right")
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.grid(axis="x", visible=False)
+    axis.margins(x=0.01)
+    figure.text(
+        0.01,
+        0.01,
+        f"Source: OpenRouter (openrouter.ai/rankings), as of {meta['as_of']}. Growth requires two adjacent complete months; gaps are blank.",
+        fontsize=8.5,
+        color="#666666",
+    )
+    figure.tight_layout(rect=(0, 0.06, 1, 0.94))
+    figure.savefig(
+        MONTHLY_GROWTH_CHART_PATH,
+        dpi=160,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(figure)
+    validate_chart(MONTHLY_GROWTH_CHART_PATH)
+
+
+def write_page(
+    dates: list[date], token_values: list[float], meta: dict[str, str]
+) -> None:
     available = [value for value in token_values if not math.isnan(value)]
     latest = date.fromisoformat(meta["end_date"])
     latest_value = available[-1]
@@ -233,6 +446,7 @@ def write_page(token_values: list[float], meta: dict[str, str]) -> None:
     generated_at = datetime.now(timezone.utc)
 
     report = {
+        "history_start_date": dates[0].isoformat(),
         "latest_reporting_date": latest.isoformat(),
         "latest_tokens": int(latest_value),
         "latest_tokens_trillions": round(latest_value / TRILLION, 4),
@@ -262,6 +476,9 @@ def write_page(token_values: list[float], meta: dict[str, str]) -> None:
     .label {{ color:#5f6368; font-size:12px; text-transform:uppercase; letter-spacing:.5px; }}
     .value {{ color:#17365D; font-size:24px; font-weight:700; margin-top:3px; }}
     img {{ display:block; width:100%; height:auto; }}
+    .chart-section {{ margin-top:30px; padding-top:24px; border-top:1px solid #e5e7eb; }}
+    h2 {{ margin:0 0 5px; color:#17365D; font-size:21px; }}
+    .description {{ margin:0 0 12px; color:#5f6368; font-size:13px; }}
     footer {{ color:#5f6368; font-size:12px; margin-top:16px; line-height:1.5; }}
   </style>
 </head>
@@ -274,8 +491,18 @@ def write_page(token_values: list[float], meta: dict[str, str]) -> None:
     <div class="stat"><div class="label">7-day average</div><div class="value">{seven_day_average / TRILLION:,.2f} T</div></div>
   </div>
   <img src="daily_usage.png" alt="OpenRouter daily token usage chart">
+  <div class="chart-section">
+    <h2>Full available history</h2>
+    <p class="description">Daily usage and its 30-day trend from 1 January 2025.</p>
+    <img src="long_term_usage.png" alt="OpenRouter full-history token usage chart">
+  </div>
+  <div class="chart-section">
+    <h2>Monthly growth</h2>
+    <p class="description">Month-over-month growth where both adjacent calendar months are complete.</p>
+    <img src="monthly_growth.png" alt="OpenRouter monthly token usage growth chart">
+  </div>
   <footer>
-    Source: OpenRouter Data API public rankings dataset. Private, hidden and zero-data-retention traffic is excluded at source.<br>
+    Source: OpenRouter (openrouter.ai/rankings), as of {html.escape(meta['as_of'])}. Private, hidden and zero-data-retention traffic is excluded at source.<br>
     Page generated {generated_at:%Y-%m-%d %H:%M UTC}.
   </footer>
 </section></main></body>
@@ -290,8 +517,10 @@ def main() -> int:
         return 1
     try:
         dates, values, meta = fetch_daily_totals(api_key)
-        render_chart(dates, values, meta)
-        write_page(values, meta)
+        render_recent_chart(dates, values, meta)
+        render_long_term_chart(dates, values, meta)
+        render_monthly_growth_chart(dates, values, meta)
+        write_page(dates, values, meta)
         print(f"Published report through {meta['end_date']} in {OUTPUT_DIRECTORY}")
         return 0
     except (ReportError, OSError, ValueError) as exc:

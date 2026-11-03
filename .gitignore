@@ -4,5 +4,7 @@ __pycache__/
 *.py[cod]
 .env
 docs/daily_usage.png
+docs/long_term_usage.png
+docs/monthly_growth.png
 docs/index.html
 docs/report.json

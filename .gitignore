@@ -1,0 +1,8 @@
+.venv/
+.matplotlib/
+__pycache__/
+*.py[cod]
+.env
+docs/daily_usage.png
+docs/index.html
+docs/report.json

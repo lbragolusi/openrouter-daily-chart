@@ -1,6 +1,9 @@
 name: Publish OpenRouter Daily Chart
 
 on:
+  push:
+    branches:
+      - main
   schedule:
     - cron: "30 6 * * *"
       timezone: "Europe/London"

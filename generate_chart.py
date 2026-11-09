@@ -8,6 +8,7 @@ import html
 import json
 import math
 import os
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -23,10 +24,13 @@ matplotlib.use("Agg")
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import requests
 
 
 API_URL = "https://openrouter.ai/api/v1/datasets/rankings-daily"
+RAMP_INDEX_URL = "https://ramp.com/data/ai-index"
+RAMP_CHART_DATA_URL = f"{RAMP_INDEX_URL}/chart-data"
 DATASET_START = date(2025, 1, 1)
 TRILLION = 1_000_000_000_000
 REPORT_DAYS = 90
@@ -34,6 +38,9 @@ OUTPUT_DIRECTORY = Path(__file__).resolve().with_name("docs")
 RECENT_CHART_PATH = OUTPUT_DIRECTORY / "daily_usage.png"
 LONG_TERM_CHART_PATH = OUTPUT_DIRECTORY / "long_term_usage.png"
 MONTHLY_GROWTH_CHART_PATH = OUTPUT_DIRECTORY / "monthly_growth.png"
+RAMP_WEEKLY_SPEND_CHART_PATH = OUTPUT_DIRECTORY / "ramp_weekly_token_spend.png"
+RAMP_SPEND_SHARE_CHART_PATH = OUTPUT_DIRECTORY / "ramp_weekly_spend_share.png"
+RAMP_TOKEN_PRICE_CHART_PATH = OUTPUT_DIRECTORY / "ramp_token_prices.png"
 INDEX_PATH = OUTPUT_DIRECTORY / "index.html"
 METADATA_PATH = OUTPUT_DIRECTORY / "report.json"
 
@@ -177,6 +184,154 @@ def fetch_daily_totals(api_key: str) -> tuple[list[date], list[float], dict[str,
         "version": ", ".join(sorted({item["version"] for item in response_meta})),
     }
     return calendar_dates, values, meta
+
+
+def request_ramp_response(
+    session: requests.Session,
+    url: str,
+    params: dict[str, str] | None = None,
+    accept: str = "application/json",
+    max_attempts: int = 5,
+) -> requests.Response:
+    headers = {
+        "Accept": accept,
+        "Referer": RAMP_INDEX_URL,
+        "User-Agent": "OpenRouter-Daily-Public-Chart/1.0",
+    }
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = session.get(
+                url, headers=headers, params=params, timeout=(10, 90)
+            )
+        except requests.RequestException as exc:
+            if attempt == max_attempts:
+                raise ReportError(f"Ramp request failed after retries: {exc}") from exc
+            time.sleep(min(2 ** (attempt - 1), 30))
+            continue
+
+        if response.status_code in (408, 425, 429) or response.status_code >= 500:
+            if attempt == max_attempts:
+                raise ReportError(
+                    f"Ramp returned HTTP {response.status_code} after retries."
+                )
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                delay = min(max(float(retry_after), 1.0), 60.0)
+            except ValueError:
+                delay = float(min(2 ** (attempt - 1), 30))
+            time.sleep(delay)
+            continue
+        if not response.ok:
+            raise ReportError(f"Ramp returned HTTP {response.status_code}.")
+        return response
+    raise AssertionError("Unreachable retry state")
+
+
+def fetch_ramp_tokenomics(
+) -> tuple[dict[date, dict[str, float]], dict[date, dict[str, tuple[float, float]]]]:
+    with requests.Session() as session:
+        page = request_ramp_response(
+            session,
+            RAMP_INDEX_URL,
+            accept="text/html,application/xhtml+xml",
+        ).text
+        version_match = re.search(
+            r'\\"dataVersion\\":\\"([A-Za-z0-9_-]+)\\"', page
+        ) or re.search(r'"dataVersion":"([A-Za-z0-9_-]+)"', page)
+        if version_match is None:
+            raise ReportError("Ramp AI Index did not expose a chart data version.")
+        version = version_match.group(1)
+
+        payloads: dict[str, Any] = {}
+        for dataset in ("tokenVolumes", "tokenPrices"):
+            response = request_ramp_response(
+                session,
+                f"{RAMP_CHART_DATA_URL}/{dataset}",
+                {"version": version},
+            )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise ReportError(f"Ramp {dataset} returned invalid JSON.") from exc
+            if not isinstance(payload, list):
+                raise ReportError(f"Ramp {dataset} returned an unexpected response.")
+            payloads[dataset] = payload
+
+    weekly_spend: dict[date, dict[str, float]] = {}
+    seen_spend: set[tuple[date, str]] = set()
+    for number, row in enumerate(payloads["tokenVolumes"], start=1):
+        if not isinstance(row, dict) or row.get("metric_key") != "token_spend":
+            continue
+        try:
+            week_start = date.fromisoformat(str(row["period_start"]))
+            week_end = date.fromisoformat(str(row["period_end"]))
+            series_key = str(row["series_key"]).strip()
+            maker = str(row["model_maker"]).strip().lower()
+            value = float(row["metric_value"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReportError(f"Ramp token spend row {number} is invalid.") from exc
+        if (
+            row.get("period_grain") != "weekly"
+            or not series_key
+            or not maker
+            or not math.isfinite(value)
+            or value < 0
+            or week_start > week_end
+        ):
+            raise ReportError(f"Ramp token spend row {number} failed validation.")
+        key = (week_end, series_key)
+        if key in seen_spend:
+            raise ReportError(f"Duplicate Ramp token spend row for {week_end} and {series_key}.")
+        seen_spend.add(key)
+        maker_values = weekly_spend.setdefault(week_end, {})
+        maker_values[maker] = maker_values.get(maker, 0.0) + value
+
+    price_history: dict[date, dict[str, tuple[float, float]]] = {}
+    seen_prices: set[tuple[date, str]] = set()
+    supported_makers = {"openai", "anthropic"}
+    for number, row in enumerate(payloads["tokenPrices"], start=1):
+        if not isinstance(row, dict) or row.get("token_type") != "all_tokens":
+            continue
+        try:
+            usage_date = date.fromisoformat(str(row["usage_date"]))
+            maker = str(row["model_maker"]).strip().lower()
+            cost = float(row["token_cost_usd_7d"])
+            count = float(row["token_count_7d"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReportError(f"Ramp token price row {number} is invalid.") from exc
+        if maker not in supported_makers:
+            continue
+        if (
+            not math.isfinite(cost)
+            or not math.isfinite(count)
+            or cost < 0
+            or count <= 0
+        ):
+            raise ReportError(f"Ramp token price row {number} failed validation.")
+        key = (usage_date, maker)
+        if key in seen_prices:
+            raise ReportError(f"Duplicate Ramp token price row for {usage_date} and {maker}.")
+        seen_prices.add(key)
+        price_history.setdefault(usage_date, {})[maker] = (cost, count)
+
+    if len(weekly_spend) < 12:
+        raise ReportError("Ramp returned too little weekly token spend history.")
+    if len(price_history) < 30:
+        raise ReportError("Ramp returned too little token price history.")
+    return weekly_spend, price_history
+
+
+def ramp_maker_label(maker: str) -> str:
+    labels = {
+        "anthropic": "Anthropic",
+        "cursor": "Cursor",
+        "google": "Google",
+        "moonshot": "Moonshot",
+        "openai": "OpenAI",
+        "xai": "xAI",
+        "zhipu": "Z.ai",
+    }
+    return labels.get(maker, maker.replace("_", " ").title())
 
 
 def rolling_average(
@@ -432,8 +587,277 @@ def render_monthly_growth_chart(
     validate_chart(MONTHLY_GROWTH_CHART_PATH)
 
 
+def render_ramp_weekly_spend_chart(
+    weekly_spend: dict[date, dict[str, float]],
+) -> None:
+    dates = sorted(weekly_spend)
+    totals = [sum(weekly_spend[day].values()) for day in dates]
+    peak = max(totals)
+    if peak <= 0:
+        raise ReportError("Ramp weekly token spend contained no positive values.")
+    index_values = [value / peak * 100 for value in totals]
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    figure, axis = plt.subplots(figsize=(11.5, 5.6))
+    axis.plot(dates, index_values, color="#17365D", linewidth=2.3)
+    axis.fill_between(dates, index_values, 0, color="#3274A1", alpha=0.16)
+    axis.scatter([dates[-1]], [index_values[-1]], color="#17365D", s=42, zorder=5)
+    axis.annotate(
+        f"{index_values[-1]:.1f}",
+        xy=(dates[-1], index_values[-1]),
+        xytext=(-10, 13),
+        textcoords="offset points",
+        ha="right",
+        color="#17365D",
+        fontsize=10,
+        fontweight="bold",
+    )
+    axis.set_title(
+        "Ramp Aggregate Weekly Token Spend Index",
+        loc="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#17365D",
+        pad=14,
+    )
+    axis.set_ylabel("Spend index (peak week = 100)")
+    axis.set_xlabel("")
+    axis.set_ylim(bottom=0)
+    axis.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    axis.tick_params(axis="x", rotation=35)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.margins(x=0.01)
+    figure.text(
+        0.01,
+        0.01,
+        f"Source: Ramp AI Index, through week ending {dates[-1]:%d %b %Y}. Ramp Token Spend Management sample; peak observed aggregate week = 100.",
+        fontsize=8.5,
+        color="#666666",
+    )
+    figure.tight_layout(rect=(0, 0.055, 1, 1))
+    figure.savefig(
+        RAMP_WEEKLY_SPEND_CHART_PATH,
+        dpi=160,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(figure)
+    validate_chart(RAMP_WEEKLY_SPEND_CHART_PATH)
+
+
+def render_ramp_spend_share_chart(
+    weekly_spend: dict[date, dict[str, float]],
+) -> None:
+    dates = sorted(weekly_spend)
+    cumulative: dict[str, float] = {}
+    for maker_values in weekly_spend.values():
+        for maker, value in maker_values.items():
+            cumulative[maker] = cumulative.get(maker, 0.0) + value
+    selected = [
+        maker
+        for maker, _ in sorted(
+            cumulative.items(), key=lambda item: item[1], reverse=True
+        )[:5]
+    ]
+    labels = [ramp_maker_label(maker) for maker in selected] + ["Other"]
+    share_series: list[list[float]] = [[] for _ in labels]
+    for day in dates:
+        maker_values = weekly_spend[day]
+        total = sum(maker_values.values())
+        if total <= 0:
+            raise ReportError(f"Ramp token spend total was zero for {day}.")
+        selected_total = 0.0
+        for index, maker in enumerate(selected):
+            value = maker_values.get(maker, 0.0)
+            selected_total += value
+            share_series[index].append(value / total * 100)
+        share_series[-1].append(max(total - selected_total, 0.0) / total * 100)
+
+    maker_colors = {
+        "anthropic": "#E1812C",
+        "openai": "#3274A1",
+        "google": "#C75050",
+        "xai": "#55A868",
+        "cursor": "#8172B3",
+    }
+    palette = [maker_colors.get(maker, "#64B5CD") for maker in selected] + [
+        "#9CA3AF"
+    ]
+    plt.style.use("seaborn-v0_8-whitegrid")
+    figure, axis = plt.subplots(figsize=(11.5, 5.6))
+    axis.stackplot(
+        dates,
+        *share_series,
+        labels=labels,
+        colors=palette,
+        alpha=0.9,
+    )
+    axis.set_title(
+        "Ramp Weekly Token Spend Market Share",
+        loc="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#17365D",
+        pad=14,
+    )
+    axis.set_ylabel("Share of weekly token spend")
+    axis.set_xlabel("")
+    axis.set_ylim(0, 100)
+    axis.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=100, decimals=0))
+    axis.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    axis.tick_params(axis="x", rotation=35)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.grid(axis="x", visible=False)
+    axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), frameon=False, ncols=3)
+    axis.margins(x=0)
+    figure.text(
+        0.01,
+        0.01,
+        f"Source: Ramp AI Index, through week ending {dates[-1]:%d %b %Y}. Shares sum to 100%; smaller makers are grouped as Other.",
+        fontsize=8.5,
+        color="#666666",
+    )
+    figure.tight_layout(rect=(0, 0.11, 1, 1))
+    figure.savefig(
+        RAMP_SPEND_SHARE_CHART_PATH,
+        dpi=160,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(figure)
+    validate_chart(RAMP_SPEND_SHARE_CHART_PATH)
+
+
+def render_ramp_token_price_chart(
+    price_history: dict[date, dict[str, tuple[float, float]]],
+) -> dict[str, float | str]:
+    maker_values: dict[str, list[float]] = {"openai": [], "anthropic": []}
+    dates = [
+        day
+        for day in sorted(price_history)
+        if all(maker in price_history[day] for maker in maker_values)
+    ]
+    if not dates:
+        raise ReportError("Ramp returned no dates shared by OpenAI and Anthropic.")
+    combined_values: list[float] = []
+    for day in dates:
+        records = price_history[day]
+        total_cost = 0.0
+        total_count = 0.0
+        for maker in maker_values:
+            record = records.get(maker)
+            if record is None:
+                maker_values[maker].append(math.nan)
+                continue
+            cost, count = record
+            maker_values[maker].append(cost / count * 1_000_000)
+            total_cost += cost
+            total_count += count
+        combined_values.append(
+            total_cost / total_count * 1_000_000 if total_count else math.nan
+        )
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    figure, axis = plt.subplots(figsize=(11.5, 5.6))
+    axis.plot(
+        dates,
+        combined_values,
+        color="#17365D",
+        linewidth=2.7,
+        label="OpenAI + Anthropic",
+    )
+    axis.plot(
+        dates,
+        maker_values["openai"],
+        color="#3274A1",
+        linewidth=1.8,
+        label="OpenAI",
+    )
+    axis.plot(
+        dates,
+        maker_values["anthropic"],
+        color="#E1812C",
+        linewidth=1.8,
+        label="Anthropic",
+    )
+    latest_combined = combined_values[-1]
+    axis.scatter([dates[-1]], [latest_combined], color="#17365D", s=42, zorder=5)
+    axis.annotate(
+        f"${latest_combined:,.2f}",
+        xy=(dates[-1], latest_combined),
+        xytext=(-10, 13),
+        textcoords="offset points",
+        ha="right",
+        color="#17365D",
+        fontsize=10,
+        fontweight="bold",
+    )
+    axis.set_title(
+        "Ramp Historical Blended Token Price — 7-day Rolling",
+        loc="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#17365D",
+        pad=14,
+    )
+    axis.set_ylabel("USD per million tokens")
+    axis.set_xlabel("")
+    axis.set_ylim(bottom=0)
+    axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("${x:,.2f}"))
+    axis.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    axis.tick_params(axis="x", rotation=35)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.legend(loc="upper right", frameon=False, ncols=3)
+    axis.margins(x=0.01)
+    figure.text(
+        0.01,
+        0.01,
+        f"Source: Ramp AI Index, through {dates[-1]:%d %b %Y}. Realized 7-day blended price across all tokens in the Ramp Token Spend Management sample.",
+        fontsize=8.5,
+        color="#666666",
+    )
+    figure.tight_layout(rect=(0, 0.055, 1, 1))
+    figure.savefig(
+        RAMP_TOKEN_PRICE_CHART_PATH,
+        dpi=160,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(figure)
+    validate_chart(RAMP_TOKEN_PRICE_CHART_PATH)
+
+    latest_records = price_history[dates[-1]]
+    openai_cost, openai_count = latest_records["openai"]
+    anthropic_cost, anthropic_count = latest_records["anthropic"]
+    return {
+        "latest_date": dates[-1].isoformat(),
+        "combined_price_per_million": round(latest_combined, 4),
+        "openai_price_per_million": round(openai_cost / openai_count * 1_000_000, 4),
+        "anthropic_price_per_million": round(
+            anthropic_cost / anthropic_count * 1_000_000, 4
+        ),
+    }
+
+
+def render_ramp_charts(
+    weekly_spend: dict[date, dict[str, float]],
+    price_history: dict[date, dict[str, tuple[float, float]]],
+) -> dict[str, float | str]:
+    render_ramp_weekly_spend_chart(weekly_spend)
+    render_ramp_spend_share_chart(weekly_spend)
+    meta = render_ramp_token_price_chart(price_history)
+    meta["latest_week_end"] = max(weekly_spend).isoformat()
+    return meta
+
+
 def write_page(
-    dates: list[date], token_values: list[float], meta: dict[str, str]
+    dates: list[date],
+    token_values: list[float],
+    meta: dict[str, str],
+    ramp_meta: dict[str, float | str],
 ) -> None:
     available = [value for value in token_values if not math.isnan(value)]
     latest = date.fromisoformat(meta["end_date"])
@@ -455,6 +879,15 @@ def write_page(
         ),
         "seven_reported_day_average_trillions": round(seven_day_average / TRILLION, 4),
         "api_as_of": meta["as_of"],
+        "ramp_latest_week_end": ramp_meta["latest_week_end"],
+        "ramp_token_price_date": ramp_meta["latest_date"],
+        "ramp_combined_price_per_million": ramp_meta[
+            "combined_price_per_million"
+        ],
+        "ramp_openai_price_per_million": ramp_meta["openai_price_per_million"],
+        "ramp_anthropic_price_per_million": ramp_meta[
+            "anthropic_price_per_million"
+        ],
         "generated_at_utc": generated_at.isoformat(timespec="seconds"),
     }
     METADATA_PATH.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -501,8 +934,24 @@ def write_page(
     <p class="description">Month-over-month growth where both adjacent calendar months are complete.</p>
     <img src="monthly_growth.png" alt="OpenRouter monthly token usage growth chart">
   </div>
+  <div class="chart-section">
+    <h2>Ramp aggregate weekly token spend</h2>
+    <p class="description">Aggregate weekly spend index across models in Ramp's Token Spend Management sample; the peak observed week equals 100.</p>
+    <img src="ramp_weekly_token_spend.png" alt="Ramp aggregate weekly token spend index chart">
+  </div>
+  <div class="chart-section">
+    <h2>Ramp weekly token spend market share</h2>
+    <p class="description">Weekly model-maker shares shown as a 100% stacked area chart.</p>
+    <img src="ramp_weekly_spend_share.png" alt="Ramp weekly token spend market share chart">
+  </div>
+  <div class="chart-section">
+    <h2>Ramp blended token prices</h2>
+    <p class="description">Historical seven-day blended price per million tokens for OpenAI, Anthropic, and the two makers combined.</p>
+    <img src="ramp_token_prices.png" alt="Ramp historical blended token price chart">
+  </div>
   <footer>
     Source: OpenRouter (openrouter.ai/rankings), as of {html.escape(meta['as_of'])}. Private, hidden and zero-data-retention traffic is excluded at source.<br>
+    Ramp charts: Ramp AI Index, data from businesses using Ramp Token Spend Management; this sample is not representative of all Ramp AI spending.<br>
     Page generated {generated_at:%Y-%m-%d %H:%M UTC}.
   </footer>
 </section></main></body>
@@ -517,10 +966,12 @@ def main() -> int:
         return 1
     try:
         dates, values, meta = fetch_daily_totals(api_key)
+        weekly_spend, price_history = fetch_ramp_tokenomics()
         render_recent_chart(dates, values, meta)
         render_long_term_chart(dates, values, meta)
         render_monthly_growth_chart(dates, values, meta)
-        write_page(dates, values, meta)
+        ramp_meta = render_ramp_charts(weekly_spend, price_history)
+        write_page(dates, values, meta, ramp_meta)
         print(f"Published report through {meta['end_date']} in {OUTPUT_DIRECTORY}")
         return 0
     except (ReportError, OSError, ValueError) as exc:

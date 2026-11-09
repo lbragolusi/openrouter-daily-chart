@@ -41,6 +41,9 @@ MONTHLY_GROWTH_CHART_PATH = OUTPUT_DIRECTORY / "monthly_growth.png"
 RAMP_WEEKLY_SPEND_CHART_PATH = OUTPUT_DIRECTORY / "ramp_weekly_token_spend.png"
 RAMP_SPEND_SHARE_CHART_PATH = OUTPUT_DIRECTORY / "ramp_weekly_spend_share.png"
 RAMP_TOKEN_PRICE_CHART_PATH = OUTPUT_DIRECTORY / "ramp_token_prices.png"
+TOKEN_VOLUME_COMPARISON_CHART_PATH = (
+    OUTPUT_DIRECTORY / "ramp_openrouter_token_volume_comparison.png"
+)
 INDEX_PATH = OUTPUT_DIRECTORY / "index.html"
 METADATA_PATH = OUTPUT_DIRECTORY / "report.json"
 
@@ -228,7 +231,11 @@ def request_ramp_response(
 
 
 def fetch_ramp_tokenomics(
-) -> tuple[dict[date, dict[str, float]], dict[date, dict[str, tuple[float, float]]]]:
+) -> tuple[
+    dict[date, dict[str, float]],
+    dict[date, dict[str, float]],
+    dict[date, dict[str, tuple[float, float]]],
+]:
     with requests.Session() as session:
         page = request_ramp_response(
             session,
@@ -257,10 +264,19 @@ def fetch_ramp_tokenomics(
                 raise ReportError(f"Ramp {dataset} returned an unexpected response.")
             payloads[dataset] = payload
 
-    weekly_spend: dict[date, dict[str, float]] = {}
-    seen_spend: set[tuple[date, str]] = set()
+    weekly_metrics: dict[str, dict[date, dict[str, float]]] = {
+        "token_spend": {},
+        "token_volume": {},
+    }
+    seen_metrics: dict[str, set[tuple[date, str]]] = {
+        "token_spend": set(),
+        "token_volume": set(),
+    }
     for number, row in enumerate(payloads["tokenVolumes"], start=1):
-        if not isinstance(row, dict) or row.get("metric_key") != "token_spend":
+        if not isinstance(row, dict):
+            continue
+        metric_key = str(row.get("metric_key", ""))
+        if metric_key not in weekly_metrics:
             continue
         try:
             week_start = date.fromisoformat(str(row["period_start"]))
@@ -269,7 +285,7 @@ def fetch_ramp_tokenomics(
             maker = str(row["model_maker"]).strip().lower()
             value = float(row["metric_value"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise ReportError(f"Ramp token spend row {number} is invalid.") from exc
+            raise ReportError(f"Ramp {metric_key} row {number} is invalid.") from exc
         if (
             row.get("period_grain") != "weekly"
             or not series_key
@@ -278,12 +294,14 @@ def fetch_ramp_tokenomics(
             or value < 0
             or week_start > week_end
         ):
-            raise ReportError(f"Ramp token spend row {number} failed validation.")
+            raise ReportError(f"Ramp {metric_key} row {number} failed validation.")
         key = (week_end, series_key)
-        if key in seen_spend:
-            raise ReportError(f"Duplicate Ramp token spend row for {week_end} and {series_key}.")
-        seen_spend.add(key)
-        maker_values = weekly_spend.setdefault(week_end, {})
+        if key in seen_metrics[metric_key]:
+            raise ReportError(
+                f"Duplicate Ramp {metric_key} row for {week_end} and {series_key}."
+            )
+        seen_metrics[metric_key].add(key)
+        maker_values = weekly_metrics[metric_key].setdefault(week_end, {})
         maker_values[maker] = maker_values.get(maker, 0.0) + value
 
     price_history: dict[date, dict[str, tuple[float, float]]] = {}
@@ -314,11 +332,15 @@ def fetch_ramp_tokenomics(
         seen_prices.add(key)
         price_history.setdefault(usage_date, {})[maker] = (cost, count)
 
+    weekly_spend = weekly_metrics["token_spend"]
+    weekly_volume = weekly_metrics["token_volume"]
     if len(weekly_spend) < 12:
         raise ReportError("Ramp returned too little weekly token spend history.")
+    if len(weekly_volume) < 12:
+        raise ReportError("Ramp returned too little weekly token volume history.")
     if len(price_history) < 30:
         raise ReportError("Ramp returned too little token price history.")
-    return weekly_spend, price_history
+    return weekly_spend, weekly_volume, price_history
 
 
 def ramp_maker_label(maker: str) -> str:
@@ -842,13 +864,139 @@ def render_ramp_token_price_chart(
     }
 
 
+def render_normalized_token_volume_comparison(
+    openrouter_dates: list[date],
+    openrouter_token_values: list[float],
+    ramp_weekly_volume: dict[date, dict[str, float]],
+) -> dict[str, float | str]:
+    openrouter_daily = {
+        day: value
+        for day, value in zip(openrouter_dates, openrouter_token_values)
+        if not math.isnan(value)
+    }
+    common_dates: list[date] = []
+    openrouter_weekly: list[float] = []
+    ramp_weekly: list[float] = []
+    for week_end in sorted(ramp_weekly_volume):
+        week_days = [week_end - timedelta(days=offset) for offset in range(6, -1, -1)]
+        if not all(day in openrouter_daily for day in week_days):
+            continue
+        openrouter_total = sum(openrouter_daily[day] for day in week_days)
+        ramp_total = sum(ramp_weekly_volume[week_end].values())
+        if openrouter_total <= 0 or ramp_total <= 0:
+            continue
+        common_dates.append(week_end)
+        openrouter_weekly.append(openrouter_total)
+        ramp_weekly.append(ramp_total)
+
+    if len(common_dates) < 12:
+        raise ReportError(
+            "Too few complete weeks overlap between OpenRouter and Ramp token volume."
+        )
+    openrouter_base = openrouter_weekly[0]
+    ramp_base = ramp_weekly[0]
+    openrouter_index = [value / openrouter_base * 100 for value in openrouter_weekly]
+    ramp_index = [value / ramp_base * 100 for value in ramp_weekly]
+    blended_index = [
+        (openrouter_value + ramp_value) / 2
+        for openrouter_value, ramp_value in zip(openrouter_index, ramp_index)
+    ]
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    figure, axis = plt.subplots(figsize=(11.5, 5.6))
+    axis.plot(
+        common_dates,
+        blended_index,
+        color="#17365D",
+        linewidth=2.8,
+        label="50/50 blended index",
+    )
+    axis.plot(
+        common_dates,
+        openrouter_index,
+        color="#3274A1",
+        linewidth=1.9,
+        label="OpenRouter",
+    )
+    axis.plot(
+        common_dates,
+        ramp_index,
+        color="#E1812C",
+        linewidth=1.9,
+        label="Ramp",
+    )
+    axis.axhline(100, color="#9CA3AF", linewidth=1, linestyle="--")
+    axis.scatter(
+        [common_dates[-1]], [blended_index[-1]], color="#17365D", s=42, zorder=5
+    )
+    axis.annotate(
+        f"{blended_index[-1]:,.1f}",
+        xy=(common_dates[-1], blended_index[-1]),
+        xytext=(-10, 13),
+        textcoords="offset points",
+        ha="right",
+        color="#17365D",
+        fontsize=10,
+        fontweight="bold",
+    )
+    axis.set_title(
+        "Normalized Weekly Token Volume — OpenRouter vs Ramp",
+        loc="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#17365D",
+        pad=14,
+    )
+    axis.set_ylabel("Token volume index (first common week = 100, log scale)")
+    axis.set_xlabel("")
+    axis.set_yscale("log")
+    axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+    axis.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    axis.tick_params(axis="x", rotation=35)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.legend(loc="upper left", frameon=False, ncols=3)
+    axis.margins(x=0.01)
+    figure.text(
+        0.01,
+        0.01,
+        f"Sources: OpenRouter public rankings and Ramp AI Index. Weekly series are rebased to 100 at week ending {common_dates[0]:%d %b %Y}; blend gives each source 50% weight. Ramp is a Token Spend Management sample.",
+        fontsize=8.5,
+        color="#666666",
+    )
+    figure.tight_layout(rect=(0, 0.055, 1, 1))
+    figure.savefig(
+        TOKEN_VOLUME_COMPARISON_CHART_PATH,
+        dpi=160,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(figure)
+    validate_chart(TOKEN_VOLUME_COMPARISON_CHART_PATH)
+    return {
+        "comparison_start_week": common_dates[0].isoformat(),
+        "comparison_latest_week": common_dates[-1].isoformat(),
+        "comparison_openrouter_index": round(openrouter_index[-1], 4),
+        "comparison_ramp_index": round(ramp_index[-1], 4),
+        "comparison_blended_index": round(blended_index[-1], 4),
+    }
+
+
 def render_ramp_charts(
+    openrouter_dates: list[date],
+    openrouter_token_values: list[float],
     weekly_spend: dict[date, dict[str, float]],
+    weekly_volume: dict[date, dict[str, float]],
     price_history: dict[date, dict[str, tuple[float, float]]],
 ) -> dict[str, float | str]:
     render_ramp_weekly_spend_chart(weekly_spend)
     render_ramp_spend_share_chart(weekly_spend)
     meta = render_ramp_token_price_chart(price_history)
+    meta.update(
+        render_normalized_token_volume_comparison(
+            openrouter_dates, openrouter_token_values, weekly_volume
+        )
+    )
     meta["latest_week_end"] = max(weekly_spend).isoformat()
     return meta
 
@@ -887,6 +1035,15 @@ def write_page(
         "ramp_openai_price_per_million": ramp_meta["openai_price_per_million"],
         "ramp_anthropic_price_per_million": ramp_meta[
             "anthropic_price_per_million"
+        ],
+        "volume_comparison_start_week": ramp_meta["comparison_start_week"],
+        "volume_comparison_latest_week": ramp_meta["comparison_latest_week"],
+        "volume_comparison_openrouter_index": ramp_meta[
+            "comparison_openrouter_index"
+        ],
+        "volume_comparison_ramp_index": ramp_meta["comparison_ramp_index"],
+        "volume_comparison_blended_index": ramp_meta[
+            "comparison_blended_index"
         ],
         "generated_at_utc": generated_at.isoformat(timespec="seconds"),
     }
@@ -949,6 +1106,11 @@ def write_page(
     <p class="description">Historical seven-day blended price per million tokens for OpenAI, Anthropic, and the two makers combined.</p>
     <img src="ramp_token_prices.png" alt="Ramp historical blended token price chart">
   </div>
+  <div class="chart-section">
+    <h2>Normalized token volume comparison</h2>
+    <p class="description">OpenRouter and Ramp weekly token volumes rebased to 100 in their first common complete week, plus an equal-weight 50/50 blended index.</p>
+    <img src="ramp_openrouter_token_volume_comparison.png" alt="Normalized OpenRouter and Ramp token volume comparison chart">
+  </div>
   <footer>
     Source: OpenRouter (openrouter.ai/rankings), as of {html.escape(meta['as_of'])}. Private, hidden and zero-data-retention traffic is excluded at source.<br>
     Ramp charts: Ramp AI Index, data from businesses using Ramp Token Spend Management; this sample is not representative of all Ramp AI spending.<br>
@@ -966,11 +1128,13 @@ def main() -> int:
         return 1
     try:
         dates, values, meta = fetch_daily_totals(api_key)
-        weekly_spend, price_history = fetch_ramp_tokenomics()
+        weekly_spend, weekly_volume, price_history = fetch_ramp_tokenomics()
         render_recent_chart(dates, values, meta)
         render_long_term_chart(dates, values, meta)
         render_monthly_growth_chart(dates, values, meta)
-        ramp_meta = render_ramp_charts(weekly_spend, price_history)
+        ramp_meta = render_ramp_charts(
+            dates, values, weekly_spend, weekly_volume, price_history
+        )
         write_page(dates, values, meta, ramp_meta)
         print(f"Published report through {meta['end_date']} in {OUTPUT_DIRECTORY}")
         return 0

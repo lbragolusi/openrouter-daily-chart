@@ -1,9 +1,10 @@
 # OpenRouter Public Token Usage Charts
 
-This repository publishes six static charts: three from OpenRouter's official public rankings
+This repository publishes seven static charts: three from OpenRouter's official public rankings
 dataset (recent daily usage, full-history usage from 2025-01-01, and monthly growth rates),
 plus three from the Ramp AI Index (aggregate weekly token spend, weekly spend market share,
-and historical blended token prices).
+and historical blended token prices), and an equal-weight normalized token-volume comparison
+between OpenRouter and Ramp.
 GitHub Actions refreshes the GitHub Pages site every day at **06:30 Europe/London**, leaving
 a 90-minute buffer before a separate Power Automate email runs at 08:00.
 
@@ -31,6 +32,7 @@ The resulting addresses will be:
 - Ramp weekly-spend image: `https://GITHUB_USERNAME.github.io/openrouter-daily-chart/ramp_weekly_token_spend.png`
 - Ramp spend-share image: `https://GITHUB_USERNAME.github.io/openrouter-daily-chart/ramp_weekly_spend_share.png`
 - Ramp token-price image: `https://GITHUB_USERNAME.github.io/openrouter-daily-chart/ramp_token_prices.png`
+- Normalized volume-comparison image: `https://GITHUB_USERNAME.github.io/openrouter-daily-chart/ramp_openrouter_token_volume_comparison.png`
 
 ## Power Automate setup
 
@@ -122,6 +124,20 @@ Use this HTML body after replacing `GITHUB_USERNAME`:
     <img
       src="https://GITHUB_USERNAME.github.io/openrouter-daily-chart/ramp_token_prices.png?v=@{formatDateTime(convertTimeZone(utcNow(),'UTC','GMT Standard Time'),'yyyyMMdd')}"
       alt="Ramp historical blended token prices"
+      style="display:block;width:100%;max-width:1100px;height:auto;border:0;"
+    >
+  </a>
+</p>
+
+<h3>Normalized token volume: OpenRouter versus Ramp</h3>
+<p style="color:#5f6368;font-size:13px;">
+  Weekly token volumes rebased to 100 in the first common complete week, with a blended index giving OpenRouter and Ramp 50% weight each.
+</p>
+<p>
+  <a href="https://GITHUB_USERNAME.github.io/openrouter-daily-chart/">
+    <img
+      src="https://GITHUB_USERNAME.github.io/openrouter-daily-chart/ramp_openrouter_token_volume_comparison.png?v=@{formatDateTime(convertTimeZone(utcNow(),'UTC','GMT Standard Time'),'yyyyMMdd')}"
+      alt="Normalized OpenRouter and Ramp token volume comparison"
       style="display:block;width:100%;max-width:1100px;height:auto;border:0;"
     >
   </a>

@@ -234,7 +234,7 @@ def fetch_ramp_tokenomics(
 ) -> tuple[
     dict[date, dict[str, float]],
     dict[date, dict[str, float]],
-    dict[date, dict[str, tuple[float, float]]],
+    dict[date, dict[str, float]],
 ]:
     with requests.Session() as session:
         page = request_ramp_response(
@@ -304,33 +304,29 @@ def fetch_ramp_tokenomics(
         maker_values = weekly_metrics[metric_key].setdefault(week_end, {})
         maker_values[maker] = maker_values.get(maker, 0.0) + value
 
-    price_history: dict[date, dict[str, tuple[float, float]]] = {}
+    price_history: dict[date, dict[str, float]] = {}
     seen_prices: set[tuple[date, str]] = set()
-    supported_makers = {"openai", "anthropic"}
+    supported_series = {"openai", "anthropic", "blend"}
     for number, row in enumerate(payloads["tokenPrices"], start=1):
         if not isinstance(row, dict) or row.get("token_type") != "all_tokens":
             continue
         try:
             usage_date = date.fromisoformat(str(row["usage_date"]))
-            maker = str(row["model_maker"]).strip().lower()
-            cost = float(row["token_cost_usd_7d"])
-            count = float(row["token_count_7d"])
+            series = str(row["series_key"]).strip().lower()
+            price = float(row["price_per_million"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ReportError(f"Ramp token price row {number} is invalid.") from exc
-        if maker not in supported_makers:
+        if series not in supported_series:
             continue
-        if (
-            not math.isfinite(cost)
-            or not math.isfinite(count)
-            or cost < 0
-            or count <= 0
-        ):
+        if not math.isfinite(price) or price < 0:
             raise ReportError(f"Ramp token price row {number} failed validation.")
-        key = (usage_date, maker)
+        key = (usage_date, series)
         if key in seen_prices:
-            raise ReportError(f"Duplicate Ramp token price row for {usage_date} and {maker}.")
+            raise ReportError(
+                f"Duplicate Ramp token price row for {usage_date} and {series}."
+            )
         seen_prices.add(key)
-        price_history.setdefault(usage_date, {})[maker] = (cost, count)
+        price_history.setdefault(usage_date, {})[series] = price
 
     weekly_spend = weekly_metrics["token_spend"]
     weekly_volume = weekly_metrics["token_volume"]
@@ -753,33 +749,25 @@ def render_ramp_spend_share_chart(
 
 
 def render_ramp_token_price_chart(
-    price_history: dict[date, dict[str, tuple[float, float]]],
+    price_history: dict[date, dict[str, float]],
 ) -> dict[str, float | str]:
     maker_values: dict[str, list[float]] = {"openai": [], "anthropic": []}
+    required_series = ("openai", "anthropic", "blend")
     dates = [
         day
         for day in sorted(price_history)
-        if all(maker in price_history[day] for maker in maker_values)
+        if all(series in price_history[day] for series in required_series)
     ]
     if not dates:
-        raise ReportError("Ramp returned no dates shared by OpenAI and Anthropic.")
+        raise ReportError(
+            "Ramp returned no dates shared by OpenAI, Anthropic, and blend."
+        )
     combined_values: list[float] = []
     for day in dates:
         records = price_history[day]
-        total_cost = 0.0
-        total_count = 0.0
         for maker in maker_values:
-            record = records.get(maker)
-            if record is None:
-                maker_values[maker].append(math.nan)
-                continue
-            cost, count = record
-            maker_values[maker].append(cost / count * 1_000_000)
-            total_cost += cost
-            total_count += count
-        combined_values.append(
-            total_cost / total_count * 1_000_000 if total_count else math.nan
-        )
+            maker_values[maker].append(records[maker])
+        combined_values.append(records["blend"])
 
     plt.style.use("seaborn-v0_8-whitegrid")
     figure, axis = plt.subplots(figsize=(11.5, 5.6))
@@ -852,15 +840,11 @@ def render_ramp_token_price_chart(
     validate_chart(RAMP_TOKEN_PRICE_CHART_PATH)
 
     latest_records = price_history[dates[-1]]
-    openai_cost, openai_count = latest_records["openai"]
-    anthropic_cost, anthropic_count = latest_records["anthropic"]
     return {
         "latest_date": dates[-1].isoformat(),
-        "combined_price_per_million": round(latest_combined, 4),
-        "openai_price_per_million": round(openai_cost / openai_count * 1_000_000, 4),
-        "anthropic_price_per_million": round(
-            anthropic_cost / anthropic_count * 1_000_000, 4
-        ),
+        "combined_price_per_million": round(latest_records["blend"], 4),
+        "openai_price_per_million": round(latest_records["openai"], 4),
+        "anthropic_price_per_million": round(latest_records["anthropic"], 4),
     }
 
 
@@ -987,7 +971,7 @@ def render_ramp_charts(
     openrouter_token_values: list[float],
     weekly_spend: dict[date, dict[str, float]],
     weekly_volume: dict[date, dict[str, float]],
-    price_history: dict[date, dict[str, tuple[float, float]]],
+    price_history: dict[date, dict[str, float]],
 ) -> dict[str, float | str]:
     render_ramp_weekly_spend_chart(weekly_spend)
     render_ramp_spend_share_chart(weekly_spend)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import calendar
+import csv
 import html
 import json
 import math
@@ -35,6 +36,7 @@ DATASET_START = date(2025, 1, 1)
 TRILLION = 1_000_000_000_000
 REPORT_DAYS = 90
 OUTPUT_DIRECTORY = Path(__file__).resolve().with_name("docs")
+GPU_RENTAL_DATA_PATH = Path(__file__).resolve().with_name("data") / "gpu_rental_prices.csv"
 RECENT_CHART_PATH = OUTPUT_DIRECTORY / "daily_usage.png"
 LONG_TERM_CHART_PATH = OUTPUT_DIRECTORY / "long_term_usage.png"
 MONTHLY_GROWTH_CHART_PATH = OUTPUT_DIRECTORY / "monthly_growth.png"
@@ -44,6 +46,11 @@ RAMP_TOKEN_PRICE_CHART_PATH = OUTPUT_DIRECTORY / "ramp_token_prices.png"
 TOKEN_VOLUME_COMPARISON_CHART_PATH = (
     OUTPUT_DIRECTORY / "ramp_openrouter_token_volume_comparison.png"
 )
+GPU_RENTAL_NORMALIZED_CHART_PATH = OUTPUT_DIRECTORY / "gpu_rental_prices_normalized.png"
+GPU_TOKEN_PRICE_COMPARISON_CHART_PATH = (
+    OUTPUT_DIRECTORY / "gpu_rental_token_price_comparison.png"
+)
+GPU_RENTAL_WEIGHTS = {"a100": 2 / 17, "h100": 5 / 17, "b200": 10 / 17}
 INDEX_PATH = OUTPUT_DIRECTORY / "index.html"
 METADATA_PATH = OUTPUT_DIRECTORY / "report.json"
 
@@ -268,7 +275,7 @@ def fetch_ramp_tokenomics(
         "token_spend": {},
         "token_volume": {},
     }
-    seen_metrics: dict[str, set[tuple[date, str]]] = {
+    seen_metrics: dict[str, set[tuple[date, str, str]]] = {
         "token_spend": set(),
         "token_volume": set(),
     }
@@ -295,10 +302,10 @@ def fetch_ramp_tokenomics(
             or week_start > week_end
         ):
             raise ReportError(f"Ramp {metric_key} row {number} failed validation.")
-        key = (week_end, series_key)
+        key = (week_end, maker, series_key)
         if key in seen_metrics[metric_key]:
             raise ReportError(
-                f"Duplicate Ramp {metric_key} row for {week_end} and {series_key}."
+                f"Duplicate Ramp {metric_key} row for {week_end}, {maker}, and {series_key}."
             )
         seen_metrics[metric_key].add(key)
         maker_values = weekly_metrics[metric_key].setdefault(week_end, {})
@@ -371,6 +378,201 @@ def rolling_average(
 def validate_chart(path: Path) -> None:
     if not path.is_file() or path.stat().st_size < 10_000:
         raise ReportError(f"The chart image {path.name} was not generated correctly.")
+
+
+def load_gpu_rental_prices() -> list[tuple[date, float, float, float]]:
+    expected_fields = [
+        "date",
+        "a100_usd_per_hour",
+        "h100_usd_per_hour",
+        "b200_usd_per_hour",
+    ]
+    try:
+        handle = GPU_RENTAL_DATA_PATH.open(newline="", encoding="utf-8")
+    except OSError as exc:
+        raise ReportError(
+            f"GPU rental-price data was not found at {GPU_RENTAL_DATA_PATH}."
+        ) from exc
+
+    records: list[tuple[date, float, float, float]] = []
+    seen_dates: set[date] = set()
+    with handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != expected_fields:
+            raise ReportError("GPU rental-price CSV has unexpected columns.")
+        for row_number, row in enumerate(reader, start=2):
+            try:
+                day = date.fromisoformat(row["date"])
+                prices = tuple(float(row[field]) for field in expected_fields[1:])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ReportError(
+                    f"GPU rental-price CSV row {row_number} is invalid."
+                ) from exc
+            if any(not math.isfinite(value) or value <= 0 for value in prices):
+                raise ReportError(
+                    f"GPU rental-price CSV row {row_number} has a non-positive price."
+                )
+            if day in seen_dates:
+                raise ReportError(f"GPU rental-price CSV has a duplicate date: {day}.")
+            seen_dates.add(day)
+            records.append((day, prices[0], prices[1], prices[2]))
+
+    records.sort(key=lambda record: record[0])
+    if len(records) < 30:
+        raise ReportError("GPU rental-price CSV contains too little history.")
+    return records
+
+
+def render_gpu_rental_normalized_chart(
+    records: list[tuple[date, float, float, float]],
+) -> None:
+    dates = [record[0] for record in records]
+    series = {
+        "A100": ([record[1] for record in records], "#55A868"),
+        "H100": ([record[2] for record in records], "#3274A1"),
+        "B200": ([record[3] for record in records], "#E1812C"),
+    }
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    figure, axis = plt.subplots(figsize=(11.5, 5.6))
+    for label, (values, color) in series.items():
+        base = values[0]
+        normalized = [value / base for value in values]
+        axis.plot(dates, normalized, color=color, linewidth=2.1, label=label)
+    axis.axhline(1, color="#9CA3AF", linewidth=1, linestyle="--")
+    axis.set_title(
+        "GPU Rental Prices — Normalized",
+        loc="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#17365D",
+        pad=14,
+    )
+    axis.set_ylabel(f"Price index ({dates[0]:%d %b %Y} = 1.0)")
+    axis.set_xlabel("")
+    axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.2f}"))
+    axis.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    axis.tick_params(axis="x", rotation=35)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.legend(loc="best", frameon=False, ncols=3)
+    axis.margins(x=0.01)
+    figure.text(
+        0.01,
+        0.01,
+        f"Source: GPU Rental Prices workbook, HC sheet, through {dates[-1]:%d %b %Y}. Each series is divided by its first observation.",
+        fontsize=8.5,
+        color="#666666",
+    )
+    figure.tight_layout(rect=(0, 0.055, 1, 1))
+    figure.savefig(
+        GPU_RENTAL_NORMALIZED_CHART_PATH,
+        dpi=160,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(figure)
+    validate_chart(GPU_RENTAL_NORMALIZED_CHART_PATH)
+
+
+def render_gpu_token_price_comparison_chart(
+    records: list[tuple[date, float, float, float]],
+    ramp_price_history: dict[date, dict[str, float]],
+) -> dict[str, float | str]:
+    gpu_dates = [record[0] for record in records]
+    gpu_blend = [
+        a100 * GPU_RENTAL_WEIGHTS["a100"]
+        + h100 * GPU_RENTAL_WEIGHTS["h100"]
+        + b200 * GPU_RENTAL_WEIGHTS["b200"]
+        for _, a100, h100, b200 in records
+    ]
+    ramp_dates = [
+        day
+        for day in sorted(ramp_price_history)
+        if gpu_dates[0] <= day <= gpu_dates[-1]
+        and "blend" in ramp_price_history[day]
+    ]
+    if not ramp_dates:
+        raise ReportError("Ramp returned no blended token-price history overlapping GPU prices.")
+    ramp_blend = [ramp_price_history[day]["blend"] for day in ramp_dates]
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    figure, gpu_axis = plt.subplots(figsize=(11.5, 5.6))
+    token_axis = gpu_axis.twinx()
+    gpu_line = gpu_axis.plot(
+        gpu_dates,
+        gpu_blend,
+        color="#17365D",
+        linewidth=2.5,
+        label="Blended GPU rental price",
+    )[0]
+    token_line = token_axis.plot(
+        ramp_dates,
+        ramp_blend,
+        color="#E1812C",
+        linewidth=2.2,
+        label="Ramp blended token price",
+    )[0]
+    gpu_axis.scatter([gpu_dates[-1]], [gpu_blend[-1]], color="#17365D", s=40, zorder=5)
+    token_axis.scatter(
+        [ramp_dates[-1]], [ramp_blend[-1]], color="#E1812C", s=40, zorder=5
+    )
+    gpu_axis.set_title(
+        "Blended GPU Rental Price vs Ramp Token Price",
+        loc="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#17365D",
+        pad=14,
+    )
+    gpu_axis.set_ylabel("Blended GPU rental price (USD per GPU-hour)", color="#17365D")
+    token_axis.set_ylabel("Ramp blended token price (USD per million tokens)", color="#E1812C")
+    gpu_axis.set_ylim(bottom=0)
+    token_axis.set_ylim(bottom=0)
+    gpu_axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("${x:,.2f}"))
+    token_axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("${x:,.2f}"))
+    gpu_axis.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    gpu_axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    gpu_axis.tick_params(axis="x", rotation=35)
+    gpu_axis.tick_params(axis="y", colors="#17365D")
+    token_axis.tick_params(axis="y", colors="#E1812C")
+    gpu_axis.spines["top"].set_visible(False)
+    token_axis.spines["top"].set_visible(False)
+    gpu_axis.legend(
+        [gpu_line, token_line],
+        [gpu_line.get_label(), token_line.get_label()],
+        loc="best",
+        frameon=False,
+    )
+    gpu_axis.margins(x=0.01)
+    figure.text(
+        0.01,
+        0.01,
+        "GPU blend weights: B200 10/17 (58.82%), H100 5/17 (29.41%), A100 2/17 (11.76%). Sources: GPU Rental Prices workbook and Ramp AI Index.",
+        fontsize=8.5,
+        color="#666666",
+    )
+    figure.tight_layout(rect=(0, 0.055, 1, 1))
+    figure.savefig(
+        GPU_TOKEN_PRICE_COMPARISON_CHART_PATH,
+        dpi=160,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(figure)
+    validate_chart(GPU_TOKEN_PRICE_COMPARISON_CHART_PATH)
+
+    return {
+        "gpu_price_start_date": gpu_dates[0].isoformat(),
+        "gpu_price_latest_date": gpu_dates[-1].isoformat(),
+        "gpu_latest_a100_usd_per_hour": round(records[-1][1], 4),
+        "gpu_latest_h100_usd_per_hour": round(records[-1][2], 4),
+        "gpu_latest_b200_usd_per_hour": round(records[-1][3], 4),
+        "gpu_latest_blend_usd_per_hour": round(gpu_blend[-1], 4),
+        "gpu_weight_a100": round(GPU_RENTAL_WEIGHTS["a100"], 6),
+        "gpu_weight_h100": round(GPU_RENTAL_WEIGHTS["h100"], 6),
+        "gpu_weight_b200": round(GPU_RENTAL_WEIGHTS["b200"], 6),
+    }
 
 
 def render_recent_chart(
@@ -990,6 +1192,7 @@ def write_page(
     token_values: list[float],
     meta: dict[str, str],
     ramp_meta: dict[str, float | str],
+    gpu_meta: dict[str, float | str],
 ) -> None:
     available = [value for value in token_values if not math.isnan(value)]
     latest = date.fromisoformat(meta["end_date"])
@@ -1029,6 +1232,7 @@ def write_page(
         "volume_comparison_blended_index": ramp_meta[
             "comparison_blended_index"
         ],
+        **gpu_meta,
         "generated_at_utc": generated_at.isoformat(timespec="seconds"),
     }
     METADATA_PATH.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -1095,9 +1299,20 @@ def write_page(
     <p class="description">OpenRouter and Ramp weekly token volumes rebased to 100 in their first common complete week, plus an equal-weight 50/50 blended index.</p>
     <img src="ramp_openrouter_token_volume_comparison.png" alt="Normalized OpenRouter and Ramp token volume comparison chart">
   </div>
+  <div class="chart-section">
+    <h2>Normalized GPU rental prices</h2>
+    <p class="description">A100, H100, and B200 rental prices rebased to 1.0 on their first reporting date.</p>
+    <img src="gpu_rental_prices_normalized.png" alt="Normalized A100, H100, and B200 GPU rental price chart">
+  </div>
+  <div class="chart-section">
+    <h2>GPU rental price versus token price</h2>
+    <p class="description">Weighted GPU rental price on the left axis and Ramp's blended token price on the right axis. GPU weights are B200 10/17, H100 5/17, and A100 2/17.</p>
+    <img src="gpu_rental_token_price_comparison.png" alt="Blended GPU rental price and Ramp token price comparison chart">
+  </div>
   <footer>
     Source: OpenRouter (openrouter.ai/rankings), as of {html.escape(meta['as_of'])}. Private, hidden and zero-data-retention traffic is excluded at source.<br>
     Ramp charts: Ramp AI Index, data from businesses using Ramp Token Spend Management; this sample is not representative of all Ramp AI spending.<br>
+    GPU rental-price charts: GPU Rental Prices workbook, HC sheet; snapshot through {html.escape(str(gpu_meta['gpu_price_latest_date']))}.<br>
     Page generated {generated_at:%Y-%m-%d %H:%M UTC}.
   </footer>
 </section></main></body>
@@ -1113,13 +1328,18 @@ def main() -> int:
     try:
         dates, values, meta = fetch_daily_totals(api_key)
         weekly_spend, weekly_volume, price_history = fetch_ramp_tokenomics()
+        gpu_prices = load_gpu_rental_prices()
         render_recent_chart(dates, values, meta)
         render_long_term_chart(dates, values, meta)
         render_monthly_growth_chart(dates, values, meta)
         ramp_meta = render_ramp_charts(
             dates, values, weekly_spend, weekly_volume, price_history
         )
-        write_page(dates, values, meta, ramp_meta)
+        render_gpu_rental_normalized_chart(gpu_prices)
+        gpu_meta = render_gpu_token_price_comparison_chart(
+            gpu_prices, price_history
+        )
+        write_page(dates, values, meta, ramp_meta, gpu_meta)
         print(f"Published report through {meta['end_date']} in {OUTPUT_DIRECTORY}")
         return 0
     except (ReportError, OSError, ValueError) as exc:

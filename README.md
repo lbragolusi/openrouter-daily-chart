@@ -1,17 +1,19 @@
 # OpenRouter Public Token Usage Charts
 
-This repository publishes seven static charts: three from OpenRouter's official public rankings
+This repository publishes nine static charts: three from OpenRouter's official public rankings
 dataset (recent daily usage, full-history usage from 2025-01-01, and monthly growth rates),
 plus three from the Ramp AI Index (aggregate weekly token spend, weekly spend market share,
 and historical blended token prices), and an equal-weight normalized token-volume comparison
-between OpenRouter and Ramp.
+between OpenRouter and Ramp. Two additional charts show normalized A100, H100, and B200 GPU
+rental prices and compare a weighted GPU rental-price blend with Ramp's blended token price.
 GitHub Actions refreshes the GitHub Pages site every day at **06:30 Europe/London**, leaving
 a 90-minute buffer before a separate Power Automate email runs at 08:00.
 
-Only OpenRouter's already-public aggregate data is published. The API key remains in GitHub
-Actions secrets. Email addresses and Microsoft credentials do not belong in this repository.
-Ramp charts use the public Ramp AI Index feed and identify Ramp as the source. Ramp tokenomics
-represent businesses using Ramp Token Spend Management and are not the entire AI market.
+OpenRouter and Ramp charts use public aggregate feeds. The GPU rental-price history is an
+approved published snapshot extracted from the source workbook's `HC` sheet. The OpenRouter API
+key remains in GitHub Actions secrets. Email addresses and Microsoft credentials do not belong
+in this repository. Ramp tokenomics represent businesses using Ramp Token Spend Management and
+are not the entire AI market.
 
 ## GitHub setup
 
@@ -33,6 +35,8 @@ The resulting addresses will be:
 - Ramp spend-share image: `https://GITHUB_USERNAME.github.io/openrouter-daily-chart/ramp_weekly_spend_share.png`
 - Ramp token-price image: `https://GITHUB_USERNAME.github.io/openrouter-daily-chart/ramp_token_prices.png`
 - Normalized volume-comparison image: `https://GITHUB_USERNAME.github.io/openrouter-daily-chart/ramp_openrouter_token_volume_comparison.png`
+- Normalized GPU rental-price image: `https://GITHUB_USERNAME.github.io/openrouter-daily-chart/gpu_rental_prices_normalized.png`
+- GPU/token price-comparison image: `https://GITHUB_USERNAME.github.io/openrouter-daily-chart/gpu_rental_token_price_comparison.png`
 
 ## Power Automate setup
 
@@ -61,7 +65,7 @@ Use this HTML body after replacing `GITHUB_USERNAME`:
 
 ```html
 <p>Hello,</p>
-<p>Please find below the latest OpenRouter usage and Ramp token-economics charts.</p>
+<p>Please find below the latest OpenRouter usage, Ramp token-economics, and GPU rental-price charts.</p>
 
 <h3>Recent daily usage</h3>
 <p>
@@ -143,14 +147,50 @@ Use this HTML body after replacing `GITHUB_USERNAME`:
   </a>
 </p>
 
+<h3>Normalized GPU rental prices</h3>
+<p style="color:#5f6368;font-size:13px;">
+  A100, H100, and B200 rental prices rebased to 1.0 on 1 January 2026.
+</p>
+<p>
+  <a href="https://GITHUB_USERNAME.github.io/openrouter-daily-chart/">
+    <img
+      src="https://GITHUB_USERNAME.github.io/openrouter-daily-chart/gpu_rental_prices_normalized.png?v=@{formatDateTime(convertTimeZone(utcNow(),'UTC','GMT Standard Time'),'yyyyMMdd')}"
+      alt="Normalized A100, H100, and B200 GPU rental prices"
+      style="display:block;width:100%;max-width:1100px;height:auto;border:0;"
+    >
+  </a>
+</p>
+
+<h3>Blended GPU rental price versus Ramp token price</h3>
+<p style="color:#5f6368;font-size:13px;">
+  GPU blend weights are B200 10/17 (58.82%), H100 5/17 (29.41%), and A100 2/17 (11.76%). Ramp's blended token price is displayed on the secondary axis.
+</p>
+<p>
+  <a href="https://GITHUB_USERNAME.github.io/openrouter-daily-chart/">
+    <img
+      src="https://GITHUB_USERNAME.github.io/openrouter-daily-chart/gpu_rental_token_price_comparison.png?v=@{formatDateTime(convertTimeZone(utcNow(),'UTC','GMT Standard Time'),'yyyyMMdd')}"
+      alt="Blended GPU rental price and Ramp token price comparison"
+      style="display:block;width:100%;max-width:1100px;height:auto;border:0;"
+    >
+  </a>
+</p>
+
 <p><a href="https://GITHUB_USERNAME.github.io/openrouter-daily-chart/">Open the full report</a></p>
-<p style="font-size:12px;color:#666;">Sources: OpenRouter Data API public rankings dataset and Ramp AI Index. Ramp tokenomics cover businesses using Ramp Token Spend Management and are not representative of the entire AI market.</p>
+<p style="font-size:12px;color:#666;">Sources: OpenRouter Data API public rankings dataset, Ramp AI Index, and the GPU Rental Prices workbook HC sheet. Ramp tokenomics cover businesses using Ramp Token Spend Management and are not representative of the entire AI market.</p>
 ```
 
 Send one test email only to the owner before adding the other recipients. If your tenant blocks
 external images by default, the full-report link remains available.
 
 ## Local test
+
+Refresh the committed GPU-price snapshot from the source workbook before publishing new data:
+
+```powershell
+python scripts/update_gpu_rental_data.py "C:\path\to\GPU Rental Prices.xlsm"
+```
+
+Then generate the report:
 
 ```powershell
 $env:OPENROUTER_API_KEY = Read-Host "OpenRouter API key"
